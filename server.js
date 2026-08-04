@@ -12,6 +12,7 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
   DisconnectReason,
 } = require("baileys");
 
@@ -146,7 +147,10 @@ async function startSocket() {
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
-    auth: authState,
+    auth: {
+      creds: authState.creds,
+      keys: makeCacheableSignalKeyStore(authState.keys, logger),
+    },
     version,
     logger,
     browser: ["TirtaBening", "Chrome", "1.0.0"],
