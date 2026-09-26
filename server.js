@@ -44,7 +44,8 @@ function addLog(level, msg, meta) {
 }
 
 // ------------ Middleware ------------
-app.use(express.json({ limit: "1mb" }));
+// Gambar tagihan/kwitansi dikirim sebagai base64 di body → butuh limit besar
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "25mb" }));
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -142,6 +143,23 @@ function buildMe(sockRef) {
   };
 }
 
+/* ------------ Simpanan pesan terkirim ------------
+ * Kalau HP penerima gagal mendekripsi sebuah pesan (sering terjadi setelah
+ * sesi sempat putus-sambung), WhatsApp mengirim "retry receipt" ke pengirim
+ * dan minta pesan itu dikirim ulang. Baileys hanya bisa melayaninya kalau
+ * kita menyediakan callback getMessage yang mengembalikan isi pesan aslinya.
+ * Tanpa ini, penerima akan berhenti di "Waiting for this message" selamanya. */
+const SENT_MAX = Number(process.env.SENT_STORE_MAX || 1000);
+const sentMessages = new Map(); // `${jid}|${id}` -> proto.IMessage
+
+function rememberSent(sent) {
+  if (!sent?.key?.id || !sent?.message) return;
+  sentMessages.set(`${sent.key.remoteJid}|${sent.key.id}`, sent.message);
+  while (sentMessages.size > SENT_MAX) {
+    sentMessages.delete(sentMessages.keys().next().value);
+  }
+}
+
 async function startSocket() {
   const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -154,6 +172,15 @@ async function startSocket() {
     version,
     logger,
     browser: ["TirtaBening", "Chrome", "1.0.0"],
+    getMessage: async (key) => {
+      const found = sentMessages.get(`${key.remoteJid}|${key.id}`);
+      addLog(found ? "info" : "warn", "Retry receipt diminta penerima", {
+        to: key.remoteJid,
+        id: key.id,
+        dilayani: !!found,
+      });
+      return found || undefined;
+    },
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -295,6 +322,7 @@ app.post("/send", writeLimiter, async (req, res) => {
 
     const jid = toJid(msisdn);
     const sent = await sock.sendMessage(jid, { text });
+    rememberSent(sent);
 
     addLog("info", "Send text OK", { to: msisdn, id: sent?.key?.id || null });
 
@@ -337,12 +365,13 @@ app.post("/send-document", writeLimiter, async (req, res) => {
       buffer = Buffer.from(base64, "base64");
     }
 
-    await sock.sendMessage(jid, {
+    const sent = await sock.sendMessage(jid, {
       document: buffer,
       mimetype: mime,
       fileName: name,
       caption: caption || "",
     });
+    rememberSent(sent);
 
     addLog("info", "Send document OK", { to, filename: name });
     return res.json({ ok: true });
@@ -388,6 +417,7 @@ app.post("/send-image", writeLimiter, async (req, res) => {
       mimetype: mime,
       caption: caption || "",
     });
+    rememberSent(sent);
     void name;
 
     addLog("info", "Send image OK", {
@@ -427,6 +457,7 @@ app.post("/bulk", writeLimiter, async (req, res) => {
         if (!msisdn) throw new Error("Nomor tidak valid");
         const jid = toJid(msisdn);
         const sent = await sock.sendMessage(jid, { text: it.text });
+        rememberSent(sent);
         results.push({
           to: msisdn,
           ok: true,
