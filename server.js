@@ -14,6 +14,7 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   DisconnectReason,
+  proto,
 } = require("baileys");
 
 const app = express();
@@ -148,17 +149,78 @@ function buildMe(sockRef) {
  * sesi sempat putus-sambung), WhatsApp mengirim "retry receipt" ke pengirim
  * dan minta pesan itu dikirim ulang. Baileys hanya bisa melayaninya kalau
  * kita menyediakan callback getMessage yang mengembalikan isi pesan aslinya.
- * Tanpa ini, penerima akan berhenti di "Waiting for this message" selamanya. */
-const SENT_MAX = Number(process.env.SENT_STORE_MAX || 1000);
-const sentMessages = new Map(); // `${jid}|${id}` -> proto.IMessage
+ * Tanpa ini, penerima berhenti di "Waiting for this message" selamanya.
+ *
+ * PENTING: kuncinya ID pesan saja, JANGAN digabung dengan nomor tujuan.
+ * Saat retry datang, key.remoteJid sering kosong (undefined) atau berbentuk
+ * alamat @lid, bukan @s.whatsapp.net seperti waktu dikirim — kunci gabungan
+ * dijamin tidak pernah ketemu. Ini terbukti di produksi: 93 permintaan retry
+ * berturut-turut gagal dilayani karena kuncinya "undefined|<id>".
+ *
+ * Disimpan juga ke berkas di dalam AUTH_DIR supaya tetap ada setelah proses
+ * restart — retry bisa datang puluhan menit setelah pesan dikirim. */
+const SENT_MAX = Number(process.env.SENT_STORE_MAX || 5000);
+const SENT_TTL_MS = Number(process.env.SENT_STORE_TTL_MS || 7 * 24 * 3600 * 1000);
+const SENT_FILE = path.join(AUTH_DIR, "sent-messages.json");
+
+const sentMessages = new Map(); // id -> { m: proto.IMessage, t: epoch ms }
+
+function muatSimpananPesan() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SENT_FILE, "utf8"));
+    const batas = Date.now() - SENT_TTL_MS;
+    let n = 0;
+    for (const [id, v] of Object.entries(raw)) {
+      if (!v?.b || !(v.t > batas)) continue;
+      try {
+        // Isi pesan memuat Buffer (kunci media), jadi harus lewat encoder proto
+        // Baileys — JSON biasa akan merusaknya saat dibaca kembali.
+        sentMessages.set(id, {
+          m: proto.Message.decode(Buffer.from(v.b, "base64")),
+          t: v.t,
+        });
+        n++;
+      } catch {}
+    }
+    addLog("info", "Simpanan pesan dimuat", { jumlah: n });
+  } catch {
+    // berkas belum ada pada jalan pertama — wajar, abaikan
+  }
+}
+
+let simpanTertunda = null;
+function jadwalkanSimpan() {
+  if (simpanTertunda) return;
+  simpanTertunda = setTimeout(() => {
+    simpanTertunda = null;
+    try {
+      const keluar = {};
+      for (const [id, v] of sentMessages) {
+        try {
+          keluar[id] = {
+            b: Buffer.from(proto.Message.encode(v.m).finish()).toString("base64"),
+            t: v.t,
+          };
+        } catch {}
+      }
+      fs.mkdirSync(AUTH_DIR, { recursive: true });
+      fs.writeFileSync(SENT_FILE, JSON.stringify(keluar));
+    } catch (e) {
+      addLog("warn", "Gagal menyimpan simpanan pesan", { error: e?.message });
+    }
+  }, 3000);
+}
 
 function rememberSent(sent) {
   if (!sent?.key?.id || !sent?.message) return;
-  sentMessages.set(`${sent.key.remoteJid}|${sent.key.id}`, sent.message);
+  sentMessages.set(sent.key.id, { m: sent.message, t: Date.now() });
   while (sentMessages.size > SENT_MAX) {
     sentMessages.delete(sentMessages.keys().next().value);
   }
+  jadwalkanSimpan();
 }
+
+muatSimpananPesan();
 
 async function startSocket() {
   const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -173,13 +235,14 @@ async function startSocket() {
     logger,
     browser: ["TirtaBening", "Chrome", "1.0.0"],
     getMessage: async (key) => {
-      const found = sentMessages.get(`${key.remoteJid}|${key.id}`);
+      const found = sentMessages.get(key?.id);
       addLog(found ? "info" : "warn", "Retry receipt diminta penerima", {
-        to: key.remoteJid,
-        id: key.id,
+        to: key?.remoteJid || "(tanpa jid)",
+        id: key?.id,
         dilayani: !!found,
+        simpanan: sentMessages.size,
       });
-      return found || undefined;
+      return found?.m || undefined;
     },
   });
 
