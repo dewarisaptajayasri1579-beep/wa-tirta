@@ -23,7 +23,11 @@ const app = express();
 const PORT = Number(process.env.PORT || 4001);
 const API_KEY = process.env.API_KEY || "";
 const SESSION_LABEL = process.env.WWS_SESSION_LABEL || "tirtabening";
-const AUTH_DIR = path.join(__dirname, `auth_info_${SESSION_LABEL}`);
+// Folder sesi WhatsApp. Di Coolify/Docker arahkan WA_AUTH_DIR ke persistent
+// volume (mis. /data) supaya sesi dan simpanan pesan tidak hilang tiap deploy.
+const AUTH_DIR =
+  process.env.WA_AUTH_DIR ||
+  path.join(__dirname, `auth_info_${SESSION_LABEL}`);
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -57,6 +61,12 @@ app.use(
     },
   }),
 );
+
+// Health check tanpa API key, untuk probe Coolify/Docker. Sengaja tidak
+// memuat nomor WhatsApp — endpoint ini terbuka untuk publik.
+app.get("/healthz", (req, res) => {
+  res.json({ ok: true, state, ready });
+});
 
 // Simple API key auth
 app.use((req, res, next) => {
@@ -97,10 +107,17 @@ let reinitLock = false;
 
 function wipeAuthDir() {
   try {
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    // Kosongkan ISI folder, jangan hapus foldernya: kalau WA_AUTH_DIR menunjuk
+    // ke persistent volume, menghapus titik mount-nya akan gagal atau merusak.
+    for (const nama of fs.readdirSync(AUTH_DIR)) {
+      fs.rmSync(path.join(AUTH_DIR, nama), { recursive: true, force: true });
+    }
+    sentMessages.clear();
     addLog("info", "Auth dir wiped", { dir: AUTH_DIR });
   } catch (e) {
-    addLog("error", "Gagal wipe auth dir", { error: e?.message });
+    if (e?.code !== "ENOENT") {
+      addLog("error", "Gagal wipe auth dir", { error: e?.message });
+    }
   }
 }
 
